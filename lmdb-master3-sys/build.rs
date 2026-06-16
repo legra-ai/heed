@@ -124,11 +124,29 @@ fn main() {
         warn!("Building with `-fsanitize=fuzzer`.");
     }
 
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // macOS uses System V semaphores (via `MDB_USE_ROBUST` below) unless the
+    // caller explicitly opted into POSIX named semaphores. The SysV creation
+    // path in the pinned `mdb.c` submodule has two defects (collision-prone
+    // `ftok` keys and owner-only 0600 perms) that surface as intermittent
+    // EACCES on `semget` across users; patch them when that path is live.
+    let use_sysv_sem = target_os == "macos" && !cfg!(feature = "posix-sem");
+    let mdb_c = if use_sysv_sem {
+        patch_mdb_sysv_sem(&lmdb.join("mdb.c"), &out_dir.join("mdb.c"))
+    } else {
+        lmdb.join("mdb.c")
+    };
+
     let mut builder = cc::Build::new();
 
     builder
         .define("MDB_IDL_LOGN", Some(MDB_IDL_LOGN.to_string().as_str()))
-        .file(lmdb.join("mdb.c"))
+        // The patched `mdb.c` lives in OUT_DIR, so its quoted includes of
+        // `lmdb.h` / `midl.h` need the original source dir on the search path.
+        .include(&lmdb)
+        .file(&mdb_c)
         .file(lmdb.join("midl.c"))
         // https://github.com/mozilla/lmdb/blob/b7df2cac50fb41e8bd16aab4cc5fd167be9e032a/libraries/liblmdb/Makefile#L23
         .flag_if_supported("-Wno-unused-parameter")
@@ -158,9 +176,9 @@ fn main() {
     // `MDB_USE_POSIX_MUTEX` and never enters either of these
     // branches. The `posix-sem` feature is left as an explicit
     // opt-in so anyone who deliberately needs POSIX-named sems can
-    // still get them.
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" && !cfg!(feature = "posix-sem") {
+    // still get them. The SysV creation path is additionally patched in OUT_DIR
+    // (see `patch_mdb_sysv_sem`) to fix `ftok` key collisions and 0600 perms.
+    if use_sysv_sem {
         builder.define("MDB_USE_ROBUST", "1");
     }
 
@@ -187,4 +205,40 @@ fn main() {
     }
 
     builder.compile("liblmdb.a")
+}
+
+/// Patch the System V semaphore path of the vendored `mdb.c` and emit the
+/// result to `dst`, returning that path for the `cc` build to compile.
+///
+/// `mdb.c` ships in a pinned git submodule, so its `mdb_env_setup_locks` SysV
+/// branch can't be edited in place without dirtying the submodule. Two upstream
+/// defects make `semget` fail intermittently with EACCES on macOS:
+///
+///  * **Key collisions.** Upstream derives the IPC key with
+///    `ftok(lockpath, 'M')`, which folds only the low 16 bits of the inode into
+///    the key. Distinct databases collide routinely — a collision either
+///    cross-wires two unrelated envs onto one semaphore set or, across users,
+///    fails the second opener with EACCES because the colliding set is private
+///    to another uid. We hash the full lockfile path for a near-unique 31-bit
+///    key instead.
+///  * **Owner-only perms.** Upstream creates the set with the env's file mode
+///    (commonly 0600). A SysV writer lock is legitimately shared — including by
+///    several uids that open the same DB — so 0600 turns every cross-uid attach
+///    into EACCES. We create it 0666; the lockfile and data-file perms still
+///    gate who may `open` the env.
+///
+/// Panics if the upstream anchor text is absent (e.g. a future submodule bump
+/// reworked the block) so the buggy `ftok`/0600 path can never ship silently.
+fn patch_mdb_sysv_sem(src: &PathBuf, dst: &PathBuf) -> PathBuf {
+    const ANCHOR: &str = "\t\tkey_t key = ftok(fname->mn_val, 'M'); /* fname is lockfile path now */\n\t\tif (key == -1)\n\t\t\tgoto fail_errno;\n\t\tsemid = semget(key, 2, (mode & 0777) | IPC_CREAT);";
+    const REPLACEMENT: &str = "\t\t/* WWKG fork patch (applied by build.rs): ftok() folds only the\n\t\t * low 16 bits of the inode into the IPC key, so distinct DBs\n\t\t * collide — a collision cross-wires two envs onto one semaphore\n\t\t * set, or (across uids) fails the second opener with EACCES when\n\t\t * the set is private to another user. Derive the key from an\n\t\t * FNV-1a hash of the full lockfile path (mdb_hash is gated behind\n\t\t * MDB_USE_HASH, which this build does not enable) for a\n\t\t * near-unique 31-bit value instead. */\n\t\tunsigned long long wwkg_h = 0xcbf29ce484222325ULL;\n\t\tconst unsigned char *wwkg_p = (const unsigned char *)fname->mn_val;\n\t\tkey_t key;\n\t\twhile (*wwkg_p)\n\t\t\twwkg_h = (wwkg_h ^ *wwkg_p++) * 0x100000001b3ULL;\n\t\tkey = (key_t)(wwkg_h & 0x7fffffff);\n\t\tif (key == IPC_PRIVATE)\n\t\t\tkey = 1;\t/* 0 is IPC_PRIVATE; nudge to a stable nonzero key */\n\t\t/* 0666, not the env's mode (commonly 0600): a SysV writer lock is\n\t\t * legitimately shared, including by several uids opening the same\n\t\t * DB, so private perms would turn every cross-uid attach into\n\t\t * EACCES. The lockfile and data-file perms still gate open(). */\n\t\tsemid = semget(key, 2, 0666 | IPC_CREAT);";
+
+    let original = std::fs::read_to_string(src).expect("read vendored mdb.c");
+    assert!(
+        original.contains(ANCHOR),
+        "mdb.c SysV-sem anchor not found; the vendored submodule changed — \
+         re-verify the ftok/0600 fix in build.rs against the new mdb.c"
+    );
+    std::fs::write(dst, original.replace(ANCHOR, REPLACEMENT)).expect("write patched mdb.c");
+    dst.clone()
 }

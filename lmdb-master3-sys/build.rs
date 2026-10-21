@@ -8,6 +8,8 @@ extern crate bindgen;
 mod generate;
 
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(all(
@@ -108,6 +110,32 @@ macro_rules! warn {
     };
 }
 
+/// Reserve the AEAD tag once per encrypted overflow allocation.
+///
+/// Cargo's synchronous build-script boundary creates a patched translation
+/// unit in OUT_DIR; the tracked upstream submodule remains unchanged.
+fn overflow_tag_source(lmdb: &Path) -> PathBuf {
+    let mut source = fs::read_to_string(lmdb.join("mdb.c"))
+        .expect("read LMDB source for encrypted overflow allocation repair");
+    for (old, new) in [
+        (
+            "OVPAGES(data->mv_size, env->me_psize)",
+            "OVPAGES(data->mv_size + env->me_esumsize, env->me_psize)",
+        ),
+        (
+            "OVPAGES(data->mv_size, mc->mc_txn->mt_env->me_psize)",
+            "OVPAGES(data->mv_size + mc->mc_txn->mt_env->me_esumsize, mc->mc_txn->mt_env->me_psize)",
+        ),
+    ] {
+        assert_eq!(source.matches(old).count(), 1, "LMDB overflow allocation source changed: {old}");
+        source = source.replace(old, new);
+    }
+    let output =
+        PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR")).join("mdb-overflow-tag.c");
+    fs::write(&output, source).expect("write patched LMDB translation unit");
+    output
+}
+
 fn main() {
     #[cfg(feature = "bindgen")]
     generate::generate();
@@ -131,7 +159,8 @@ fn main() {
 
     builder
         .define("MDB_IDL_LOGN", Some(MDB_IDL_LOGN.to_string().as_str()))
-        .file(lmdb.join("mdb.c"))
+        .include(&lmdb)
+        .file(overflow_tag_source(&lmdb))
         .file(lmdb.join("midl.c"))
         // https://github.com/mozilla/lmdb/blob/b7df2cac50fb41e8bd16aab4cc5fd167be9e032a/libraries/liblmdb/Makefile#L23
         .flag_if_supported("-Wno-unused-parameter")

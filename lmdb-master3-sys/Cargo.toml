@@ -39,6 +39,9 @@ doctest = false
 [dependencies]
 libc = "0.2.175"
 
+[dev-dependencies]
+libc = "0.2.175"
+
 [build-dependencies]
 bindgen = { version = "0.71.1", default-features = false, optional = true, features = [
     "runtime",
